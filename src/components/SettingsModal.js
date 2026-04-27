@@ -51,14 +51,14 @@ export function SettingsModal(onClose) {
     apiPanel.innerHTML = `
         <div style="display:flex;flex-direction:column;gap:0.75rem;">
             <div>
-                <label style="display:block;font-size:0.75rem;color:rgba(255,255,255,0.5);margin-bottom:0.4rem;font-weight:600;">Muapi API Key</label>
+                <label style="display:block;font-size:0.75rem;color:rgba(255,255,255,0.5);margin-bottom:0.4rem;font-weight:600;">FAL AI API Key</label>
                 <input id="settings-api-key" type="password"
                     style="width:100%;box-sizing:border-box;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:0.75rem;padding:0.6rem 0.9rem;color:#fff;font-size:0.875rem;outline:none;"
-                    placeholder="Enter your Muapi API key..."
-                    value="${localStorage.getItem('muapi_key') || ''}">
+                    placeholder="Enter your FAL AI API key..."
+                    value="${localStorage.getItem('fal_key') || localStorage.getItem('muapi_key') || ''}">
             </div>
             <p style="font-size:0.7rem;color:rgba(255,255,255,0.3);margin:0;">
-                Your API key is stored locally and never sent anywhere except api.muapi.ai.
+                Your API key is stored locally and never sent anywhere except fal.ai.
             </p>
             <div style="display:flex;justify-content:flex-end;gap:0.5rem;margin-top:0.5rem;">
                 <button id="settings-cancel-btn" style="padding:0.5rem 1rem;border-radius:0.5rem;background:none;border:1px solid rgba(255,255,255,0.1);color:rgba(255,255,255,0.6);font-size:0.75rem;font-weight:700;cursor:pointer;">Cancel</button>
@@ -102,7 +102,8 @@ export function SettingsModal(onClose) {
     apiPanel.querySelector('#settings-save-btn').onclick = () => {
         const key = apiPanel.querySelector('#settings-api-key').value.trim();
         if (key) {
-            localStorage.setItem('muapi_key', key);
+            localStorage.setItem('fal_key', key);
+            localStorage.removeItem('muapi_key');
             close();
         } else {
             alert('Please enter a valid API key.');

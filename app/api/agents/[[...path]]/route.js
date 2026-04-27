@@ -1,14 +1,13 @@
 import { NextResponse } from 'next/server';
 
-const MUAPI_BASE = 'https://api.muapi.ai';
+const FAL_BASE = 'https://queue.fal.run';
 
 function getApiKey(request) {
-    // Priority 1: Direct x-api-key header
+    const authHeader = request.headers.get('authorization');
+    if (authHeader?.startsWith('Key ')) return authHeader.slice(4);
     const headerKey = request.headers.get('x-api-key');
     if (headerKey) return headerKey;
-
-    // Priority 2: muapi_key cookie
-    const cookieKey = request.cookies.get('muapi_key')?.value;
+    const cookieKey = request.cookies.get('fal_key')?.value || request.cookies.get('muapi_key')?.value;
     return cookieKey;
 }
 
@@ -16,16 +15,20 @@ function cleanHeaders(request) {
     const headers = new Headers(request.headers);
     headers.delete('host');
     headers.delete('connection');
-    headers.delete('cookie'); // CRITICAL: Stop forwarding browser cookies to MuAPI
+    headers.delete('cookie');
     return headers;
 }
 
-// Build the target URL without a trailing slash when path is empty.
-// e.g. GET /api/agents?is_template=true  → https://api.muapi.ai/agents?is_template=true
-// e.g. GET /api/agents/by-slug/foo       → https://api.muapi.ai/agents/by-slug/foo
+function setAuth(headers, apiKey) {
+    if (apiKey) {
+        headers.set('Authorization', `Key ${apiKey}`);
+        headers.delete('x-api-key');
+    }
+}
+
 function buildTargetUrl(pathSegments, search) {
     const path = pathSegments.join('/');
-    const base = `${MUAPI_BASE}/agents`;
+    const base = `${FAL_BASE}/agents`;
     return path ? `${base}/${path}${search}` : `${base}${search}`;
 }
 
@@ -38,7 +41,7 @@ export async function GET(request, { params }) {
     const headers = cleanHeaders(request);
     const apiKey = getApiKey(request);
     console.log(`[agents proxy GET] ${targetUrl} | apiKey: ${apiKey ? apiKey.slice(0,8)+'...' : 'MISSING'}`);
-    if (apiKey) headers.set('x-api-key', apiKey);
+    setAuth(headers, apiKey);
 
     try {
         const response = await fetch(targetUrl, { headers, method: 'GET' });
@@ -58,7 +61,7 @@ export async function POST(request, { params }) {
     const headers = cleanHeaders(request);
     const apiKey = getApiKey(request);
     console.log(`[agents proxy POST] ${targetUrl} | apiKey: ${apiKey ? apiKey.slice(0,8)+'...' : 'MISSING'}`);
-    if (apiKey) headers.set('x-api-key', apiKey);
+    setAuth(headers, apiKey);
 
     try {
         const body = await request.arrayBuffer();
@@ -78,7 +81,7 @@ export async function DELETE(request, { params }) {
 
     const headers = cleanHeaders(request);
     const apiKey = getApiKey(request);
-    if (apiKey) headers.set('x-api-key', apiKey);
+    setAuth(headers, apiKey);
 
     try {
         const response = await fetch(targetUrl, { method: 'DELETE', headers });
@@ -97,7 +100,7 @@ export async function PUT(request, { params }) {
 
     const headers = cleanHeaders(request);
     const apiKey = getApiKey(request);
-    if (apiKey) headers.set('x-api-key', apiKey);
+    setAuth(headers, apiKey);
 
     try {
         const body = await request.arrayBuffer();

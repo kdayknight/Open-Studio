@@ -1,25 +1,52 @@
 import { getModelById, getVideoModelById, getI2IModelById, getI2VModelById, getV2VModelById, getLipSyncModelById } from './models.js';
 
-const BASE_URL = 'https://api.muapi.ai';
-const PROXY_WF_BASE = '/api/workflow';
+const FAL_BASE = 'https://queue.fal.run';
+const FAL_CDN = 'https://fal.ai';
 
-async function pollForResult(requestId, key, maxAttempts = 900, interval = 2000) {
-    const pollUrl = `${BASE_URL}/api/v1/predictions/${requestId}/result`;
+function authHeaders(key) {
+    return {
+        'Content-Type': 'application/json',
+        'Authorization': `Key ${key}`
+    };
+}
+
+function extractImageUrl(result) {
+    return result?.images?.[0]?.url || result?.image?.url || result?.outputs?.[0] || result?.url;
+}
+
+function extractVideoUrl(result) {
+    return result?.video?.url || result?.videos?.[0]?.url || result?.outputs?.[0] || result?.url;
+}
+
+async function pollForResult(falEndpoint, requestId, key, maxAttempts = 900, interval = 2000) {
+    const statusUrl = `${FAL_BASE}/${falEndpoint}/requests/${requestId}/status`;
+    const resultUrl = `${FAL_BASE}/${falEndpoint}/requests/${requestId}`;
+
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         await new Promise(resolve => setTimeout(resolve, interval));
         try {
-            const response = await fetch(pollUrl, {
-                headers: { 'Content-Type': 'application/json', 'x-api-key': key }
+            const statusResponse = await fetch(statusUrl, {
+                headers: authHeaders(key)
             });
-            if (!response.ok) {
-                const errText = await response.text();
-                if (response.status >= 500) continue;
-                throw new Error(`Poll Failed: ${response.status} - ${errText.slice(0, 100)}`);
+            if (!statusResponse.ok) {
+                if (statusResponse.status >= 500) continue;
+                const errText = await statusResponse.text();
+                throw new Error(`Poll Failed: ${statusResponse.status} - ${errText.slice(0, 100)}`);
             }
-            const data = await response.json();
-            const status = data.status?.toLowerCase();
-            if (status === 'completed' || status === 'succeeded' || status === 'success') return data;
-            if (status === 'failed' || status === 'error') throw new Error(`Generation failed: ${data.error || 'Unknown error'}`);
+            const statusData = await statusResponse.json();
+            const status = statusData.status;
+
+            if (status === 'COMPLETED') {
+                const resultResponse = await fetch(resultUrl, { headers: authHeaders(key) });
+                if (!resultResponse.ok) {
+                    const errText = await resultResponse.text();
+                    throw new Error(`Result fetch failed: ${resultResponse.status} - ${errText.slice(0, 100)}`);
+                }
+                return await resultResponse.json();
+            }
+            if (status === 'FAILED' || status === 'ERROR') {
+                throw new Error(`Generation failed: ${statusData.error || 'Unknown error'}`);
+            }
         } catch (error) {
             if (attempt === maxAttempts) throw error;
         }
@@ -27,11 +54,11 @@ async function pollForResult(requestId, key, maxAttempts = 900, interval = 2000)
     throw new Error('Generation timed out after polling.');
 }
 
-async function submitAndPoll(endpoint, payload, key, onRequestId, maxAttempts = 60) {
-    const url = `${BASE_URL}/api/v1/${endpoint}`;
+async function submitAndPoll(falEndpoint, payload, key, onRequestId, maxAttempts = 60) {
+    const url = `${FAL_BASE}/${falEndpoint}`;
     const response = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': key },
+        headers: authHeaders(key),
         body: JSON.stringify(payload)
     });
     if (!response.ok) {
@@ -39,36 +66,37 @@ async function submitAndPoll(endpoint, payload, key, onRequestId, maxAttempts = 
         throw new Error(`API Request Failed: ${response.status} ${response.statusText} - ${errText.slice(0, 100)}`);
     }
     const submitData = await response.json();
-    const requestId = submitData.request_id || submitData.id;
+    const requestId = submitData.request_id;
     if (!requestId) return submitData;
     if (onRequestId) onRequestId(requestId);
-    const result = await pollForResult(requestId, key, maxAttempts);
-    const outputUrl = result.outputs?.[0] || result.url || result.output?.url;
-    return { ...result, url: outputUrl };
+    return await pollForResult(falEndpoint, requestId, key, maxAttempts);
 }
 
 export async function generateImage(apiKey, params) {
     const modelInfo = getModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
+    const falEndpoint = `fal-ai/${endpoint}`;
     const payload = { prompt: params.prompt };
     if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
     if (params.resolution) payload.resolution = params.resolution;
     if (params.quality) payload.quality = params.quality;
-    if (params.image_url) { 
-        payload.image_url = params.image_url; 
-        payload.strength = params.strength || 0.6; 
+    if (params.image_url) {
+        payload.image_url = params.image_url;
+        payload.strength = params.strength || 0.6;
     } else if (params.images_list) {
         payload.images_list = params.images_list;
     } else {
         payload.image_url = null;
     }
     if (params.seed && params.seed !== -1) payload.seed = params.seed;
-    return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 60);
+    const result = await submitAndPoll(falEndpoint, payload, apiKey, params.onRequestId, 60);
+    return { ...result, url: extractImageUrl(result) };
 }
 
 export async function generateI2I(apiKey, params) {
     const modelInfo = getI2IModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
+    const falEndpoint = `fal-ai/${endpoint}`;
     const payload = {};
     if (params.prompt) payload.prompt = params.prompt;
     const imageField = modelInfo?.imageField || 'image_url';
@@ -80,12 +108,14 @@ export async function generateI2I(apiKey, params) {
     if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
     if (params.resolution) payload.resolution = params.resolution;
     if (params.quality) payload.quality = params.quality;
-    return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 60);
+    const result = await submitAndPoll(falEndpoint, payload, apiKey, params.onRequestId, 60);
+    return { ...result, url: extractImageUrl(result) };
 }
 
 export async function generateVideo(apiKey, params) {
     const modelInfo = getVideoModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
+    const falEndpoint = `fal-ai/${endpoint}`;
     const payload = {};
     if (params.prompt) payload.prompt = params.prompt;
     if (params.aspect_ratio) payload.aspect_ratio = params.aspect_ratio;
@@ -94,12 +124,14 @@ export async function generateVideo(apiKey, params) {
     if (params.quality) payload.quality = params.quality;
     if (params.mode) payload.mode = params.mode;
     if (params.image_url) payload.image_url = params.image_url;
-    return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 900);
+    const result = await submitAndPoll(falEndpoint, payload, apiKey, params.onRequestId, 900);
+    return { ...result, url: extractVideoUrl(result) };
 }
 
 export async function generateI2V(apiKey, params) {
     const modelInfo = getI2VModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
+    const falEndpoint = `fal-ai/${endpoint}`;
     const payload = {};
     if (params.prompt) payload.prompt = params.prompt;
     const imageField = modelInfo?.imageField || 'image_url';
@@ -112,11 +144,13 @@ export async function generateI2V(apiKey, params) {
     if (params.resolution) payload.resolution = params.resolution;
     if (params.quality) payload.quality = params.quality;
     if (params.mode) payload.mode = params.mode;
-    return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 900);
+    const result = await submitAndPoll(falEndpoint, payload, apiKey, params.onRequestId, 900);
+    return { ...result, url: extractVideoUrl(result) };
 }
 
 export async function generateMarketingStudioAd(apiKey, params) {
     const endpoint = params.resolution === '1080p' ? 'sd-2-vip-omni-reference-1080p' : 'seedance-2-vip-omni-reference';
+    const falEndpoint = `fal-ai/${endpoint}`;
     const payload = {
         prompt: params.prompt,
         aspect_ratio: params.aspect_ratio || '16:9',
@@ -124,12 +158,14 @@ export async function generateMarketingStudioAd(apiKey, params) {
         images_list: params.images_list || [],
         video_files: params.video_files || []
     };
-    return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 900);
+    const result = await submitAndPoll(falEndpoint, payload, apiKey, params.onRequestId, 900);
+    return { ...result, url: extractVideoUrl(result) };
 }
 
 export async function processLipSync(apiKey, params) {
     const modelInfo = getLipSyncModelById(params.model);
     const endpoint = modelInfo?.endpoint || params.model;
+    const falEndpoint = `fal-ai/${endpoint}`;
     const payload = {};
     if (params.audio_url) payload.audio_url = params.audio_url;
     if (params.image_url) payload.image_url = params.image_url;
@@ -137,18 +173,19 @@ export async function processLipSync(apiKey, params) {
     if (params.prompt) payload.prompt = params.prompt;
     if (params.resolution) payload.resolution = params.resolution;
     if (params.seed !== undefined && params.seed !== -1) payload.seed = params.seed;
-    return submitAndPoll(endpoint, payload, apiKey, params.onRequestId, 900);
+    const result = await submitAndPoll(falEndpoint, payload, apiKey, params.onRequestId, 900);
+    return { ...result, url: extractVideoUrl(result) };
 }
 
 export function uploadFile(apiKey, file, onProgress) {
     return new Promise((resolve, reject) => {
-        const url = `${BASE_URL}/api/v1/upload_file`;
+        const url = `${FAL_CDN}/v1/serverless/files/file/upload`;
         const formData = new FormData();
-        formData.append('file', file);
+        formData.append('file_upload', file);
 
         const xhr = new XMLHttpRequest();
         xhr.open('POST', url);
-        xhr.setRequestHeader('x-api-key', apiKey);
+        xhr.setRequestHeader('Authorization', `Key ${apiKey}`);
 
         if (onProgress) {
             xhr.upload.onprogress = (event) => {
@@ -163,7 +200,7 @@ export function uploadFile(apiKey, file, onProgress) {
             if (xhr.status >= 200 && xhr.status < 300) {
                 try {
                     const data = JSON.parse(xhr.responseText);
-                    const fileUrl = data.url || data.file_url || data.data?.url;
+                    const fileUrl = data.url || data.access_url || data.file_url;
                     if (!fileUrl) {
                         reject(new Error('No URL returned from file upload'));
                     } else {
@@ -177,9 +214,7 @@ export function uploadFile(apiKey, file, onProgress) {
                 try {
                     const errObj = JSON.parse(xhr.responseText);
                     detail = errObj.detail || detail;
-                } catch (e) {
-                    // fallback to statusText
-                }
+                } catch (e) {}
                 reject(new Error(`File upload failed: ${xhr.status} - ${detail}`));
             }
         };
@@ -190,11 +225,8 @@ export function uploadFile(apiKey, file, onProgress) {
 }
 
 export async function getUserBalance(apiKey) {
-    const response = await fetch(`${BASE_URL}/api/v1/account/balance`, {
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+    const response = await fetch(`${FAL_BASE}/api/v1/account/balance`, {
+        headers: authHeaders(apiKey)
     });
     if (!response.ok) {
         const errText = await response.text();
@@ -204,200 +236,121 @@ export async function getUserBalance(apiKey) {
 }
 
 export async function getTemplateWorkflows(apiKey) {
-    const response = await fetch(`${BASE_URL}/workflow/get-template-workflows`, {
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+    const response = await fetch(`${FAL_BASE}/workflow/get-template-workflows`, {
+        headers: authHeaders(apiKey)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to fetch template workflows: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to fetch template workflows: ${response.status}`);
     return await response.json();
-};
+}
 
 export async function getUserWorkflows(apiKey) {
-    const response = await fetch(`${BASE_URL}/workflow/get-workflow-defs`, {
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+    const response = await fetch(`${FAL_BASE}/workflow/get-workflow-defs`, {
+        headers: authHeaders(apiKey)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to fetch user workflows: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to fetch user workflows: ${response.status}`);
     return await response.json();
-};
+}
 
 export async function getPublishedWorkflows(apiKey) {
-    const response = await fetch(`${BASE_URL}/workflow/get-published-workflows`, {
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+    const response = await fetch(`${FAL_BASE}/workflow/get-published-workflows`, {
+        headers: authHeaders(apiKey)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to fetch published workflows: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to fetch published workflows: ${response.status}`);
     return await response.json();
-};
+}
 
-// Agents — uses direct URL → https://api.muapi.ai/agents/...
 export async function getTemplateAgents(apiKey) {
-    const response = await fetch(`${BASE_URL}/agents/templates/agents`, {
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+    const response = await fetch(`${FAL_BASE}/agents/templates/agents`, {
+        headers: authHeaders(apiKey)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to fetch template agents: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to fetch template agents: ${response.status}`);
     const data = await response.json();
     return Array.isArray(data) ? data : (data.agents || data.items || []);
-};
+}
 
 export async function getUserAgents(apiKey) {
-    const response = await fetch(`${BASE_URL}/agents/user/agents`, {
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+    const response = await fetch(`${FAL_BASE}/agents/user/agents`, {
+        headers: authHeaders(apiKey)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to fetch user agents: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to fetch user agents: ${response.status}`);
     const data = await response.json();
     return Array.isArray(data) ? data : (data.agents || data.items || []);
-};
+}
 
 export async function getPublishedAgents(apiKey) {
-    // MuAPI: GET /agents/featured/agents
-    const response = await fetch(`${BASE_URL}/agents/featured/agents`, {
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+    const response = await fetch(`${FAL_BASE}/agents/featured/agents`, {
+        headers: authHeaders(apiKey)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to fetch featured agents: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to fetch featured agents: ${response.status}`);
     const data = await response.json();
     return Array.isArray(data) ? data : (data.agents || data.items || []);
-};
+}
 
-// GET /agents/user/conversations — returns the user's chat history across all agents
 export async function getUserConversations(apiKey) {
-    const response = await fetch(`${BASE_URL}/agents/user/conversations`, {
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+    const response = await fetch(`${FAL_BASE}/agents/user/conversations`, {
+        headers: authHeaders(apiKey)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to fetch conversations: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to fetch conversations: ${response.status}`);
     const data = await response.json();
     return Array.isArray(data) ? data : [];
-};
+}
 
 export async function createWorkflow(apiKey, payload) {
-    const response = await fetch(`${BASE_URL}/workflow/create`, {
+    const response = await fetch(`${FAL_BASE}/workflow/create`, {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        },
+        headers: authHeaders(apiKey),
         body: JSON.stringify(payload)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to create workflow: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to create workflow: ${response.status}`);
     return await response.json();
-};
+}
 
 export async function updateWorkflowName(apiKey, workflowId, name) {
-    const response = await fetch(`${BASE_URL}/workflow/update-name/${workflowId}`, {
+    const response = await fetch(`${FAL_BASE}/workflow/update-name/${workflowId}`, {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        },
+        headers: authHeaders(apiKey),
         body: JSON.stringify({ name })
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to rename workflow: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to rename workflow: ${response.status}`);
     return await response.json();
-};
+}
 
 export async function deleteWorkflow(apiKey, workflowId) {
-    const response = await fetch(`${BASE_URL}/workflow/delete-workflow-def/${workflowId}`, {
+    const response = await fetch(`${FAL_BASE}/workflow/delete-workflow-def/${workflowId}`, {
         method: 'DELETE',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+        headers: authHeaders(apiKey)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to delete workflow: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to delete workflow: ${response.status}`);
     return await response.json();
-};
+}
 
 export async function getWorkflowInputs(apiKey, workflowId) {
-    const response = await fetch(`${BASE_URL}/workflow/${workflowId}/api-inputs`, {
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+    const response = await fetch(`${FAL_BASE}/workflow/${workflowId}/api-inputs`, {
+        headers: authHeaders(apiKey)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to fetch workflow inputs: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to fetch workflow inputs: ${response.status}`);
     return await response.json();
-};
+}
 
 export async function executeWorkflow(apiKey, workflowId, inputs) {
-    const response = await fetch(`${BASE_URL}/workflow/${workflowId}/api-execute`, {
+    const response = await fetch(`${FAL_BASE}/workflow/${workflowId}/api-execute`, {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        },
+        headers: authHeaders(apiKey),
         body: JSON.stringify({ inputs })
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to execute workflow: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to execute workflow: ${response.status}`);
     const submitData = await response.json();
     const runId = submitData.run_id || submitData.id;
     if (!runId) return submitData;
-    
-    // Poll for results
     return await pollWorkflowResult(runId, apiKey);
-};
+}
 
 async function pollWorkflowResult(runId, apiKey, maxAttempts = 900, interval = 2000) {
-    const pollUrl = `${BASE_URL}/workflow/run/${runId}/api-outputs`;
+    const pollUrl = `${FAL_BASE}/workflow/run/${runId}/api-outputs`;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         await new Promise(resolve => setTimeout(resolve, interval));
         try {
-            const response = await fetch(pollUrl, {
-                headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey }
-            });
+            const response = await fetch(pollUrl, { headers: authHeaders(apiKey) });
             if (!response.ok) {
                 if (response.status >= 500) continue;
                 throw new Error(`Poll Failed: ${response.status}`);
@@ -411,110 +364,71 @@ async function pollWorkflowResult(runId, apiKey, maxAttempts = 900, interval = 2
         }
     }
     throw new Error('Workflow timed out after polling.');
-};
+}
 
 export async function getAllNodeSchemas(apiKey, workflowId) {
-    const response = await fetch(`${BASE_URL}/workflow/${workflowId}/node-schemas`, {
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+    const response = await fetch(`${FAL_BASE}/workflow/${workflowId}/node-schemas`, {
+        headers: authHeaders(apiKey)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to fetch node schemas: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to fetch node schemas: ${response.status}`);
     return await response.json();
-};
+}
 
 export async function getWorkflowData(apiKey, workflowId) {
-    const response = await fetch(`${BASE_URL}/workflow/get-workflow-def/${workflowId}`, {
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+    const response = await fetch(`${FAL_BASE}/workflow/get-workflow-def/${workflowId}`, {
+        headers: authHeaders(apiKey)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to fetch workflow data: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to fetch workflow data: ${response.status}`);
     return await response.json();
-};
+}
 
 export async function getNodeSchemas(apiKey, workflowId) {
-    const response = await fetch(`${BASE_URL}/workflow/${workflowId}/api-node-schemas`, {
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+    const response = await fetch(`${FAL_BASE}/workflow/${workflowId}/api-node-schemas`, {
+        headers: authHeaders(apiKey)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to fetch node schemas: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to fetch node schemas: ${response.status}`);
     return await response.json();
 }
 
 export async function runSingleNode(apiKey, workflowId, nodeId, payload) {
-    const response = await fetch(`${BASE_URL}/workflow/${workflowId}/node/${nodeId}/run`, {
+    const response = await fetch(`${FAL_BASE}/workflow/${workflowId}/node/${nodeId}/run`, {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        },
+        headers: authHeaders(apiKey),
         body: JSON.stringify(payload)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to run single node: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to run single node: ${response.status}`);
     return await response.json();
 }
 
 export async function deleteNodeRun(apiKey, nodeRunId) {
-    const response = await fetch(`${BASE_URL}/workflow/node-run/${nodeRunId}`, {
+    const response = await fetch(`${FAL_BASE}/workflow/node-run/${nodeRunId}`, {
         method: 'DELETE',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+        headers: authHeaders(apiKey)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to delete node run: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to delete node run: ${response.status}`);
     return await response.json();
 }
 
 export async function getNodeStatus(apiKey, runId) {
-    const response = await fetch(`${BASE_URL}/workflow/run/${runId}/status`, {
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        }
+    const response = await fetch(`${FAL_BASE}/workflow/run/${runId}/status`, {
+        headers: authHeaders(apiKey)
     });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Failed to get node status: ${response.status} - ${errText.slice(0, 100)}`);
-    }
+    if (!response.ok) throw new Error(`Failed to get node status: ${response.status}`);
     return await response.json();
 }
 
-/**
- * Handle proxy requests centralizing communication logic with MuAPI.
- * This is used by the server-side entry points.
- */
 export async function handleProxyRequest(prefix, path, method, headers, body, apiKey) {
-    const url = `${BASE_URL}/${prefix}/${path}`;
-    
+    const url = `${FAL_BASE}/${prefix}/${path}`;
+
     const finalHeaders = new Headers(headers);
     finalHeaders.delete('host');
     finalHeaders.delete('connection');
-    finalHeaders.delete('content-length'); // Let fetch recalculate this for safety
+    finalHeaders.delete('content-length');
 
     if (apiKey) {
-        finalHeaders.set('x-api-key', apiKey);
+        finalHeaders.set('Authorization', `Key ${apiKey}`);
     }
+    finalHeaders.delete('x-api-key');
 
     try {
         const response = await fetch(url, {
@@ -526,27 +440,24 @@ export async function handleProxyRequest(prefix, path, method, headers, body, ap
 
         const contentType = response.headers.get('Content-Type') || 'application/json';
         const buffer = await response.arrayBuffer();
-        
+
         return {
             status: response.status,
             contentType,
             data: buffer
         };
     } catch (error) {
-        console.error(`MuAPI Proxy error for ${url}:`, error);
+        console.error(`FAL Proxy error for ${url}:`, error);
         throw error;
     }
 }
 
-/**
- * A centralized handler for Next.js API routes or middleware.
- */
 export async function handleServerSideProxy(prefix, request, params, apiKey) {
     try {
         const slug = await params;
         const pathSegments = slug.path || [];
         const path = pathSegments.join('/');
-        
+
         const method = request.method;
         let body = null;
         if (method !== 'GET' && method !== 'HEAD') {
@@ -556,14 +467,7 @@ export async function handleServerSideProxy(prefix, request, params, apiKey) {
         const { search } = new URL(request.url);
         const pathWithSearch = search ? `${path}${search}` : path;
 
-        return await handleProxyRequest(
-            prefix, 
-            pathWithSearch, 
-            method, 
-            request.headers, 
-            body, 
-            apiKey
-        );
+        return await handleProxyRequest(prefix, pathWithSearch, method, request.headers, body, apiKey);
     } catch (error) {
         console.error(`Server proxy failed:`, error);
         throw error;
@@ -571,12 +475,9 @@ export async function handleServerSideProxy(prefix, request, params, apiKey) {
 }
 
 export async function calculateDynamicCost(apiKey, taskName, payload) {
-    const response = await fetch(`${BASE_URL}/api/v1/app/calculate_dynamic_cost`, {
+    const response = await fetch(`${FAL_BASE}/api/v1/app/calculate_dynamic_cost`, {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey
-        },
+        headers: authHeaders(apiKey),
         body: JSON.stringify({ task_name: taskName, payload })
     });
     if (!response.ok) {
